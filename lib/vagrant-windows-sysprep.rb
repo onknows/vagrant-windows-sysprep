@@ -31,69 +31,88 @@ module VagrantPlugins
           # see https://github.com/hashicorp/vagrant/blob/master/plugins/provisioners/shell/provisioner.rb
           def provision
             ps = 'PowerShell -ExecutionPolicy Bypass -OutputFormat Text'
+            sysprep_marker_path = "C:/Windows/Setup/Sysprep"
+            marker_contents = "Sysprep performed by Vagrant. WARNING: If you remove this file, Vagrant will sysprep this file again."
 
-            original_machine_sid = ''
-            original_machine_computer_name = ''
-            info_remote_path = "C:/Windows/Temp/vagrant-windows-sysprep-info.ps1"
-            @machine.communicate.upload(
-              File.join(File.dirname(__FILE__), "vagrant-windows-sysprep", "info.ps1"),
-              info_remote_path)
-            info_command = "#{ps} -File #{info_remote_path}"
-            @machine.communicate.sudo(info_command, {elevated: true, interactive: false}) do |type, data|
-              original_machine_sid = $1.strip if data =~ /This Machine SID is (.+)/
-              original_machine_computer_name = $1.strip if data =~ /This Machine ComputerName is (.+)/
+            # Check if the sysprep marker file exists
+            check_sysprep_command = "#{ps} -Command \"Test-Path '#{sysprep_marker_path}'\""
+            marker_exists = false
+            @machine.communicate.sudo(check_sysprep_command, { elevated: true, interactive: false }) do |type, data|
+              marker_exists = data.strip.downcase == 'true'
             end
 
-            unattend_remote_path = "C:/Windows/Temp/vagrant-windows-sysprep-unattend.xml"
-            @machine.communicate.upload(
-              File.join(File.dirname(__FILE__), "vagrant-windows-sysprep", "unattend.xml"),
-              unattend_remote_path)
-
-            sysprep_remote_path = "C:/Windows/Temp/vagrant-windows-sysprep.ps1"
-            @machine.communicate.upload(
-              File.join(File.dirname(__FILE__), "vagrant-windows-sysprep", "sysprep.ps1"),
-              sysprep_remote_path)
-            sysprep_command = "#{ps} -File #{sysprep_remote_path} -Username \"#{@machine.config.winrm.username}\" -Password \"#{@machine.config.winrm.password}\""
-            begin
-              @machine.communicate.sudo(sysprep_command, {elevated: true, interactive: false}) do |type, data|
-                handle_comm(type, data)
+            if marker_exists
+              @machine.ui.success "Skipping sysprep, sysprep was already performed..."
+            else
+              # Continue with the sysprep process
+              original_machine_sid = ''
+              original_machine_computer_name = ''
+              info_remote_path = "C:/Windows/Temp/vagrant-windows-sysprep-info.ps1"
+              @machine.communicate.upload(
+                File.join(File.dirname(__FILE__), "vagrant-windows-sysprep", "info.ps1"),
+                info_remote_path)
+              info_command = "#{ps} -File #{info_remote_path}"
+              @machine.communicate.sudo(info_command, {elevated: true, interactive: false}) do |type, data|
+                original_machine_sid = $1.strip if data =~ /This Machine SID is (.+)/
+                original_machine_computer_name = $1.strip if data =~ /This Machine ComputerName is (.+)/
               end
-            rescue
-              # ignored. this should be due to the shutdown that sysprep does.
+
+              unattend_remote_path = "C:/Windows/Temp/vagrant-windows-sysprep-unattend.xml"
+              @machine.communicate.upload(
+                File.join(File.dirname(__FILE__), "vagrant-windows-sysprep", "unattend.xml"),
+                unattend_remote_path)
+
+              sysprep_remote_path = "C:/Windows/Temp/vagrant-windows-sysprep.ps1"
+              @machine.communicate.upload(
+                File.join(File.dirname(__FILE__), "vagrant-windows-sysprep", "sysprep.ps1"),
+                sysprep_remote_path)
+              sysprep_command = "#{ps} -File #{sysprep_remote_path} -Username \"#{@machine.config.winrm.username}\" -Password \"#{@machine.config.winrm.password}\""
+              begin
+                @machine.communicate.sudo(sysprep_command, {elevated: true, interactive: false}) do |type, data|
+                  handle_comm(type, data)
+                end
+              rescue
+                # ignored. this should be due to the shutdown that sysprep does.
+              end
+
+              # wait for the machine to be shutdown.
+              # NB :poweroff    is used by the VirtualBox provider.
+              # NB :shutoff     is used by the libvirt provider.
+              # NB :off         is used by the Hyper-V provider.
+              # NB :not_running is used by the VMware Desktop provider.
+              until [:poweroff, :shutoff, :off, :not_running].include? @machine.state.id
+                sleep 10
+              end
+
+              options = {}
+              options[:provision_ignore_sentinel] = false
+              @machine.action(:up, options)
+
+              machine_sid = ''
+              machine_computer_name = ''
+              @machine.communicate.sudo(info_command, {elevated: true, interactive: false}) do |type, data|
+                machine_sid = $1.strip if data =~ /This Machine SID is (.+)/
+                machine_computer_name = $1.strip if data =~ /This Machine ComputerName is (.+)/
+              end
+
+              # NB there's a bug somewhere in windows sysprep machinery that prevents it from setting the
+              #    ComputerName when the name doesn't really change (like when you use config.vm.hostname),
+              #    it will instead set the ComputerName to something like WIN-0F47SUATAF5.
+              #    this workaround will compensate for that by renaming the computer.
+              # NB sysprep works in Windows 2016 14393.2906.
+              # NB sysprep fails in Windows 2019 17763.437.
+              if machine_computer_name != original_machine_computer_name
+                @machine.ui.info "Sysprep did not correctly set ComputerName... renaming it from #{machine_computer_name} to #{original_machine_computer_name}..."
+                @machine.guest.capability(:change_host_name, original_machine_computer_name)
+              end
+
+              # Create the sysprep marker file
+              create_marker_command = "#{ps} -Command \"New-Item '#{sysprep_marker_path}' -ItemType file; Set-Content '#{sysprep_marker_path}' '#{marker_contents}'\""
+              @machine.communicate.sudo(create_marker_command, { elevated: true, interactive: false })
+
+              @machine.ui.success "The Machine SID was changed from #{original_machine_sid} to #{machine_sid}"
             end
 
-            # wait for the machine to be shutdown.
-            # NB :poweroff    is used by the VirtualBox provider.
-            # NB :shutoff     is used by the libvirt provider.
-            # NB :off         is used by the Hyper-V provider.
-            # NB :not_running is used by the VMware Desktop provider.
-            until [:poweroff, :shutoff, :off, :not_running].include? @machine.state.id
-              sleep 10
-            end
-
-            options = {}
-            options[:provision_ignore_sentinel] = false
-            @machine.action(:up, options)
-
-            machine_sid = ''
-            machine_computer_name = ''
-            @machine.communicate.sudo(info_command, {elevated: true, interactive: false}) do |type, data|
-              machine_sid = $1.strip if data =~ /This Machine SID is (.+)/
-              machine_computer_name = $1.strip if data =~ /This Machine ComputerName is (.+)/
-            end
-
-            # NB there's a bug somewhere in windows sysprep machinery that prevents it from setting the
-            #    ComputerName when the name doesn't really change (like when you use config.vm.hostname),
-            #    it will instead set the ComputerName to something like WIN-0F47SUATAF5.
-            #    this workaround will compensate for that by renaming the computer.
-            # NB sysprep works in Windows 2016 14393.2906.
-            # NB sysprep fails in Windows 2019 17763.437.
-            if machine_computer_name != original_machine_computer_name
-              @machine.ui.info "Sysprep did not correctly set ComputerName... renaming it from #{machine_computer_name} to #{original_machine_computer_name}..."
-              @machine.guest.capability(:change_host_name, original_machine_computer_name)
-            end
-
-            @machine.ui.success "The Machine SID was changed from #{original_machine_sid} to #{machine_sid}"
           end
 
           def cleanup
